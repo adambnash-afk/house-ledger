@@ -50,6 +50,18 @@
   .anchor-chip .amt{font-size:22px;font-weight:600;}
   .anchor-chip .lbl{font-size:11px;color:var(--ink-soft);text-transform:uppercase;letter-spacing:0.04em;}
 
+  .metrics-bar{
+    display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:18px;
+  }
+  .metric{
+    background:var(--panel);border:1px solid var(--line);border-radius:3px;padding:12px 14px;
+  }
+  .metric .mlabel{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:0.03em;color:var(--ink-soft);margin-bottom:5px;}
+  .metric .mval{font-family:var(--mono);font-size:20px;font-weight:600;}
+  .metric .msub{font-size:11px;color:var(--ink-soft);margin-top:3px;}
+  .metric.ok .mval{color:var(--safe);}
+  .metric.warn .mval{color:var(--danger);}
+
   .alert{
     border:1.5px solid var(--line);
     border-radius:3px;
@@ -102,6 +114,7 @@
   .badge.est{background:var(--warn-bg);color:var(--warn);}
   .badge.verify{background:var(--danger-bg);color:var(--danger);}
   .badge.overdue{background:var(--danger);color:#fff;}
+  .badge.confirmed{background:var(--safe-bg);color:var(--safe);}
   .stale-warn{color:var(--warn) !important;font-weight:600;}
   .stale-bad{color:var(--danger) !important;font-weight:600;}
   tr.pastdue td{background:#FBEDEC;}
@@ -140,7 +153,7 @@
   <div class="masthead">
     <div>
       <h1>House Bills Ledger</h1>
-      <div class="sub">••3973 — rolling cash-flow projection, anchored to real balances</div>
+      <div class="sub">rolling cash-flow projection, anchored to real balances</div>
     </div>
     <div class="anchor-chip">
       <div class="amt" id="anchorAmt">—</div>
@@ -154,6 +167,8 @@
   <div id="alertBanner" class="alert safe">
     <span class="headline">Loading projection…</span>
   </div>
+
+  <div id="metricsBar" class="metrics-bar"></div>
 
   <div class="card">
     <h2>Projected Balance — next <span id="horizonLabel">120</span> days</h2>
@@ -488,6 +503,7 @@
 
     var events = buildProjection();
     safeCall('renderAlert', function(){ renderAlert(events); });
+    safeCall('renderMetrics', function(){ renderMetrics(events); });
     safeCall('renderChart', function(){ renderChart(events); });
     safeCall('renderUpcoming', function(){ renderUpcoming(events); });
     safeCall('renderRules', function(){ renderRules(); });
@@ -505,19 +521,81 @@
       el.innerHTML = '<span class="headline">No rules loaded yet — nothing to project. Add rules or load a backup file.</span>';
       return;
     }
-    var minPoint = null;
+    // First crossing: the earliest event where the balance drops below the buffer.
+    // This is when money needs to be in the account — not the deepest point, which
+    // often comes later.
+    var firstBreach = null;
+    var deepest = events[0];
     events.forEach(function(e){
-      if(minPoint===null || e.runningBalance < minPoint.runningBalance) minPoint = e;
+      if(firstBreach===null && e.runningBalance < state.minBuffer) firstBreach = e;
+      if(e.runningBalance < deepest.runningBalance) deepest = e;
     });
-    var worst = minPoint ? minPoint.runningBalance : state.anchor.balance;
-    if(worst < state.minBuffer){
-      var need = (state.minBuffer - worst);
+    if(firstBreach){
+      // Size the top-up from the deepest dip that occurs on or after the first breach,
+      // so a single transfer covers the whole trough, not just the first dip.
+      var troughAfterBreach = firstBreach;
+      events.forEach(function(e){
+        if(e.date >= firstBreach.date && e.runningBalance < troughAfterBreach.runningBalance) troughAfterBreach = e;
+      });
+      var need = (state.minBuffer - troughAfterBreach.runningBalance);
+      var deeperLater = (troughAfterBreach.date.getTime() !== firstBreach.date.getTime());
       el.className = 'alert danger';
-      el.innerHTML = '<span class="headline">⚠ Projected shortfall: '+fmtDateShort(minPoint.date)+' — balance dips to '+fmtMoney(minPoint.runningBalance)+' after "'+minPoint.name+'". Plan to transfer in roughly '+fmtMoney(need)+' before then.</span>';
+      el.innerHTML = '<span class="headline">⚠ First shortfall: '+fmtDateShort(firstBreach.date)+
+        ' — balance drops to '+fmtMoney(firstBreach.runningBalance)+' after "'+firstBreach.name+'", below your '+fmtMoney(state.minBuffer)+' buffer. '+
+        'Transfer in about '+fmtMoney(need)+' before then'+
+        (deeperLater ? ' (sized to cover the deeper dip to '+fmtMoney(troughAfterBreach.runningBalance)+' on '+fmtDateShort(troughAfterBreach.date)+').' : '.')+
+        '</span>';
     } else {
       el.className = 'alert safe';
-      el.innerHTML = '<span class="headline">No shortfall projected in the next '+state.horizonDays+' days. Lowest point: '+fmtMoney(worst)+' on '+(minPoint?fmtDateShort(minPoint.date):'—')+'.</span>';
+      el.innerHTML = '<span class="headline">No shortfall projected in the next '+state.horizonDays+' days. Lowest point: '+fmtMoney(deepest.runningBalance)+' on '+fmtDateShort(deepest.date)+'.</span>';
     }
+  }
+
+  // Largest single top-up needed today so the running balance never dips below
+  // the buffer at any point within `days` of the anchor. That's (buffer - deepest
+  // trough) within the window, floored at 0 if the window never breaches.
+  function requiredForWindow(events, days){
+    var cutoff = addDays(parseYMD(state.anchor.date), days);
+    var trough = state.anchor.balance;
+    events.forEach(function(e){
+      if(e.date <= cutoff && e.runningBalance < trough) trough = e.runningBalance;
+    });
+    var need = state.minBuffer - trough;
+    return need > 0 ? need : 0;
+  }
+
+  function renderMetrics(events){
+    var bar = document.getElementById('metricsBar');
+    if(events.length===0){ bar.innerHTML = ''; return; }
+    var today = new Date(); today.setHours(0,0,0,0);
+
+    // days until first breach
+    var firstBreach = null;
+    events.forEach(function(e){ if(firstBreach===null && e.runningBalance < state.minBuffer) firstBreach = e; });
+    var breachMetric;
+    if(firstBreach){
+      var days = Math.round((firstBreach.date - today)/86400000);
+      var dayTxt = days <= 0 ? 'now / past due' : days + (days===1?' day':' days');
+      breachMetric = '<div class="metric warn"><div class="mlabel">Until threshold breach</div>'+
+        '<div class="mval">'+dayTxt+'</div>'+
+        '<div class="msub">first dip below '+fmtMoney(state.minBuffer)+' on '+fmtDateShort(firstBreach.date)+'</div></div>';
+    } else {
+      breachMetric = '<div class="metric ok"><div class="mlabel">Until threshold breach</div>'+
+        '<div class="mval">clear</div>'+
+        '<div class="msub">no breach in the '+state.horizonDays+'-day projection</div></div>';
+    }
+
+    var need30 = requiredForWindow(events, 30);
+    var need90 = requiredForWindow(events, 90);
+    function needMetric(label, amt, days){
+      var cls = amt > 0 ? 'warn' : 'ok';
+      var val = amt > 0 ? fmtMoney(amt) : 'none';
+      var sub = amt > 0 ? 'to stay above buffer through '+days+' days' : 'buffer held for '+days+' days';
+      return '<div class="metric '+cls+'"><div class="mlabel">Required — '+days+'-day horizon</div>'+
+        '<div class="mval">'+val+'</div><div class="msub">'+sub+'</div></div>';
+    }
+
+    bar.innerHTML = breachMetric + needMetric('30', need30, 30) + needMetric('90', need90, 90);
   }
 
   function renderChart(events){
@@ -544,6 +622,48 @@
 
     var today = new Date(); today.setHours(0,0,0,0);
     var todayT = today.getTime();
+
+    // shaded regions where the balance is below threshold.
+    // We walk each segment; where the curve is under the threshold we build a
+    // filled band between the curve and the threshold line, interpolating the
+    // exact crossing points so the shading starts/ends precisely at the line.
+    var tyShade = yPos(threshold);
+    var shade = '';
+    var band = null; // {startX, pts:[[x,y],...]} accumulating the lower boundary (the curve)
+    function xAtCross(p0, p1){
+      // linear interpolate the time where balance === threshold between two points
+      var frac = (threshold - p0.balance) / (p1.balance - p0.balance);
+      return p0.date.getTime() + frac*(p1.date.getTime()-p0.date.getTime());
+    }
+    function flushBand(endX){
+      if(!band) return;
+      // polygon: threshold line across the top, curve along the bottom (reversed)
+      var d = 'M '+band.startX.toFixed(1)+' '+tyShade.toFixed(1)+' L '+endX.toFixed(1)+' '+tyShade.toFixed(1);
+      for(var q=band.pts.length-1;q>=0;q--){ d += ' L '+band.pts[q][0].toFixed(1)+' '+band.pts[q][1].toFixed(1); }
+      d += ' Z';
+      shade += '<path d="'+d+'" fill="#8C3230" fill-opacity="0.13" stroke="none"/>';
+      band = null;
+    }
+    for(var s=1;s<points.length;s++){
+      var p0=points[s-1], p1=points[s];
+      var below0=p0.balance<threshold, below1=p1.balance<threshold;
+      var xa=xPos(p0.date.getTime()), ya=yPos(p0.balance);
+      var xb=xPos(p1.date.getTime()), yb=yPos(p1.balance);
+      if(below0 && below1){
+        if(!band){ band={startX:xa, pts:[[xa,ya]]}; }
+        band.pts.push([xb,yb]);
+      } else if(!below0 && below1){
+        var xc=xPos(xAtCross(p0,p1));
+        band={startX:xc, pts:[[xc,tyShade]]};
+        band.pts.push([xb,yb]);
+      } else if(below0 && !below1){
+        var xc2=xPos(xAtCross(p0,p1));
+        if(!band){ band={startX:xa, pts:[[xa,ya]]}; }
+        band.pts.push([xc2,tyShade]);
+        flushBand(xc2);
+      }
+    }
+    if(band){ flushBand(band.pts[band.pts.length-1][0]); }
 
     // build colored line segments (red below threshold, green otherwise), based on segment END value
     var segs = '';
@@ -592,7 +712,7 @@
     var worstDot = '<circle cx="'+xPos(worst.date.getTime()).toFixed(1)+'" cy="'+yPos(worst.balance).toFixed(1)+'" r="3.5" fill="#8C3230"/>';
 
     var svg = '<svg viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+H+'" xmlns="http://www.w3.org/2000/svg" style="display:block;">'+
-      yTicks + xTicks + thresholdLine + segs + todayLine + worstDot +
+      shade + yTicks + xTicks + thresholdLine + segs + todayLine + worstDot +
       '</svg>';
     container.innerHTML = svg;
   }
@@ -613,10 +733,19 @@
       if(isPastDue) badges += '<span class="badge overdue">overdue — reconcile</span> ';
       if(e.estimated) badges += '<span class="badge est">est</span> ';
       if(e.verify) badges += '<span class="badge verify">verify</span>';
+      var isOverridden = state.overrides.hasOwnProperty(e.overrideKey);
+      if(isOverridden) badges += '<span class="badge confirmed">confirmed</span>';
       var amtCell = '<span class="'+(e.delta<0?'neg':'pos')+'">'+fmtMoney(e.delta)+'</span>';
-      var editHtml = e.estimated ?
-        '<input class="amt-edit" data-key="'+e.overrideKey+'" data-rule="'+e.ruleId+'" type="number" step="0.01" placeholder="'+e.amount.toFixed(2)+'"> <button class="small confirm-btn" data-key="'+e.overrideKey+'" data-rule="'+e.ruleId+'">confirm</button>'
-        : '';
+      var editHtml = '';
+      if(e.estimated){
+        // not yet confirmed — offer an input to confirm the real amount
+        editHtml = '<input class="amt-edit" data-key="'+e.overrideKey+'" data-rule="'+e.ruleId+'" type="number" step="0.01" placeholder="'+e.amount.toFixed(2)+'"> <button class="small confirm-btn" data-key="'+e.overrideKey+'" data-rule="'+e.ruleId+'">confirm</button>';
+      } else if(isOverridden){
+        // already confirmed — allow correcting the entered figure or reverting to the estimate
+        editHtml = '<input class="amt-edit" data-key="'+e.overrideKey+'" data-rule="'+e.ruleId+'" type="number" step="0.01" value="'+e.amount.toFixed(2)+'"> '+
+          '<button class="small confirm-btn" data-key="'+e.overrideKey+'" data-rule="'+e.ruleId+'">save</button> '+
+          '<button class="small secondary revert-btn" data-key="'+e.overrideKey+'">revert</button>';
+      }
       tr.innerHTML =
         '<td>'+fmtDateShort(e.date)+'</td>'+
         '<td>'+e.name+' '+badges+'</td>'+
@@ -636,6 +765,13 @@
         state.overrides[key] = val;
         var rule = state.rules.find(function(r){return r.id===ruleId;});
         if(rule) rule.amount = val; // roll forward as the new "last known" estimate
+        saveState().then(render);
+      });
+    });
+    body.querySelectorAll('.revert-btn').forEach(function(btn){
+      btn.addEventListener('click', function(){
+        var key = btn.getAttribute('data-key');
+        delete state.overrides[key];
         saveState().then(render);
       });
     });
