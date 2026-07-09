@@ -124,6 +124,9 @@
     border-radius:3px;background:#fff;color:var(--ink);
   }
   input.amt-edit{width:90px;font-family:var(--mono);}
+  input.date-edit{font-family:var(--mono);font-size:12px;padding:4px 6px;width:140px;}
+  .moved-note{font-size:10.5px;color:var(--warn);margin-top:3px;}
+  .link-btn{background:none;border:none;color:var(--accent);font-size:10.5px;cursor:pointer;padding:0;text-decoration:underline;font-weight:600;}
   button{
     font-family:var(--sans);font-size:12.5px;font-weight:600;padding:7px 13px;
     border:1px solid var(--ink);background:var(--ink);color:var(--paper);border-radius:3px;
@@ -347,6 +350,10 @@
   function fmtMoney(n){ var neg = n<0; var v = Math.abs(n).toFixed(2); var parts=v.split('.'); parts[0]=parts[0].replace(/\B(?=(\d{3})+(?!\d))/g,','); return (neg?'-':'')+'$'+parts[0]+'.'+parts[1]; }
   function fmtDateShort(d){ return d.toLocaleDateString('en-US',{month:'short',day:'numeric',year: (d.getFullYear()!==new Date().getFullYear()?'numeric':undefined)}); }
   function uid(){ return 'r_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
+  function cssEsc(s){
+    if(window.CSS && CSS.escape) return CSS.escape(s);
+    return String(s).replace(/[^a-zA-Z0-9_-]/g, function(c){ return '\\'+c; });
+  }
   function safeCall(name, fn){
     try{ fn(); }
     catch(e){
@@ -368,6 +375,7 @@
       minBuffer: 500,
       horizonDays: 120,
       overrides: {},
+      dateOverrides: {},
       reconcileHistory: [],
       rules: []
     };
@@ -380,10 +388,18 @@
   // between your Mac and iPad (e.g. via a JSON file sitting in iCloud Drive).
   var STORAGE_KEY = 'houseBillsLedger_v1';
   var state = null;
+  function normalizeState(s){
+    // backfill fields that may be absent in files saved by older versions
+    if(!s.overrides) s.overrides = {};
+    if(!s.dateOverrides) s.dateOverrides = {};
+    if(!s.reconcileHistory) s.reconcileHistory = [];
+    if(!s.rules) s.rules = [];
+    return s;
+  }
   async function loadState(){
     try{
       var raw = localStorage.getItem(STORAGE_KEY);
-      if(raw){ state = JSON.parse(raw); }
+      if(raw){ state = normalizeState(JSON.parse(raw)); }
       else { state = defaultState(); await saveState(); }
     }catch(e){ console.error('localStorage read failed, using defaults', e); state = defaultState(); }
   }
@@ -455,10 +471,24 @@
       occurrences(rule, start, end).forEach(function(d){
         var r = resolveAmount(rule, d);
         var delta = (rule.category==='income') ? r.amount : -r.amount;
-        events.push({date:d, ruleId:rule.id, name:rule.name, category:rule.category, amount:r.amount, delta:delta, estimated:r.estimated, verify:!!rule.verify, overrideKey:r.key});
+        // A date override is keyed to the ORIGINAL generated date (r.key), so the
+        // tool always knows which occurrence it belongs to even after the date moves.
+        var origDate = d;
+        var effDate = d;
+        var dateMoved = false;
+        if(state.dateOverrides.hasOwnProperty(r.key)){
+          var od = parseYMD(state.dateOverrides[r.key]);
+          if(od){ effDate = od; dateMoved = (fmtYMD(od) !== fmtYMD(d)); }
+        }
+        events.push({date:effDate, origDate:origDate, dateMoved:dateMoved, ruleId:rule.id, name:rule.name, category:rule.category, amount:r.amount, delta:delta, estimated:r.estimated, verify:!!rule.verify, overrideKey:r.key});
       });
     });
-    events.sort(function(a,b){ return a.date - b.date; });
+    // sort by EFFECTIVE date (with a stable tiebreak) so a moved occurrence lands
+    // in the right place in the running balance
+    events.sort(function(a,b){
+      if(a.date - b.date !== 0) return a.date - b.date;
+      return a.origDate - b.origDate;
+    });
     var running = state.anchor.balance;
     events.forEach(function(e){ running += e.delta; e.runningBalance = running; });
     return events;
@@ -746,8 +776,13 @@
           '<button class="small confirm-btn" data-key="'+e.overrideKey+'" data-rule="'+e.ruleId+'">save</button> '+
           '<button class="small secondary revert-btn" data-key="'+e.overrideKey+'">revert</button>';
       }
+      // editable date, keyed to the occurrence's original date so it stays identifiable after moving
+      var dateCell = '<input class="date-edit" data-key="'+e.overrideKey+'" type="date" value="'+fmtYMD(e.date)+'">';
+      if(e.dateMoved){
+        dateCell += '<div class="moved-note">moved from '+fmtDateShort(e.origDate)+' <button class="link-btn date-reset-btn" data-key="'+e.overrideKey+'">reset</button></div>';
+      }
       tr.innerHTML =
-        '<td>'+fmtDateShort(e.date)+'</td>'+
+        '<td>'+dateCell+'</td>'+
         '<td>'+e.name+' '+badges+'</td>'+
         '<td class="muted">'+e.category+'</td>'+
         '<td class="num">'+amtCell+'</td>'+
@@ -759,7 +794,7 @@
       btn.addEventListener('click', function(){
         var key = btn.getAttribute('data-key');
         var ruleId = btn.getAttribute('data-rule');
-        var input = body.querySelector('input[data-key="'+key+'"]');
+        var input = body.querySelector('input.amt-edit[data-key="'+cssEsc(key)+'"]');
         var val = parseFloat(input.value);
         if(isNaN(val)) return;
         state.overrides[key] = val;
@@ -772,6 +807,28 @@
       btn.addEventListener('click', function(){
         var key = btn.getAttribute('data-key');
         delete state.overrides[key];
+        saveState().then(render);
+      });
+    });
+    body.querySelectorAll('.date-edit').forEach(function(inp){
+      inp.addEventListener('change', function(){
+        var key = inp.getAttribute('data-key');
+        var newDate = inp.value;
+        if(!newDate){ return; }
+        // the key's original date is the part after '__'
+        var origDateStr = key.split('__')[1];
+        if(newDate === origDateStr){
+          delete state.dateOverrides[key]; // moved back to original = no override
+        } else {
+          state.dateOverrides[key] = newDate;
+        }
+        saveState().then(render);
+      });
+    });
+    body.querySelectorAll('.date-reset-btn').forEach(function(btn){
+      btn.addEventListener('click', function(){
+        var key = btn.getAttribute('data-key');
+        delete state.dateOverrides[key];
         saveState().then(render);
       });
     });
@@ -954,6 +1011,12 @@
         var parts = k.split('__');
         if(parseYMD(parts[1]) < d) delete state.overrides[k];
       });
+      Object.keys(state.dateOverrides).forEach(function(k){
+        var parts = k.split('__');
+        // remove if BOTH the original slot and the moved-to date are before the anchor
+        var movedTo = parseYMD(state.dateOverrides[k]);
+        if(parseYMD(parts[1]) < d && (!movedTo || movedTo < d)) delete state.dateOverrides[k];
+      });
       saveState().then(function(){
         document.getElementById('reconcilePreview').textContent='Re-anchored.';
         document.getElementById('reanchorBtn').style.display='none';
@@ -1003,7 +1066,7 @@
       catch(err){ alert('That file is not valid JSON.'); return; }
       if(!parsed.anchor || !parsed.rules){ alert('This does not look like a ledger data file.'); return; }
       if(!confirm('Replace everything currently in the app with the contents of '+file.name+'?')) return;
-      state = parsed;
+      state = normalizeState(parsed);
       saveState().then(function(){ render(); alert('Loaded ' + file.name + '.'); });
     };
     reader.readAsText(file);
@@ -1026,7 +1089,7 @@
     catch(e){ alert('That is not valid JSON — check the paste.'); return; }
     if(!parsed.anchor || !parsed.rules){ alert('This does not look like a ledger backup file.'); return; }
     if(!confirm('This replaces everything currently in the tool with the pasted backup. Continue?')) return;
-    state = parsed;
+    state = normalizeState(parsed);
     saveState().then(function(){
       document.getElementById('importBox').value='';
       render();
