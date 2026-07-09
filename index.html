@@ -187,15 +187,23 @@
 
   <div class="tab-panel active" id="tab-upcoming">
     <div class="card">
-      <h2>Next events (edit the amount on estimated items when the real one posts)</h2>
+      <h2>Next events (edit the date or amount on any item as it actually posts)</h2>
       <table>
         <thead><tr>
           <th>Date</th><th>Item</th><th>Type</th><th class="num">Amount</th><th class="num">Running Balance</th><th></th>
         </tr></thead>
         <tbody id="upcomingBody"></tbody>
       </table>
-      <div class="row-flex" style="margin-top:12px;">
+      <div class="row-flex" style="margin-top:12px;justify-content:space-between;">
         <button class="secondary small" id="addOneoffBtn">+ Add a one-off (dividend, Greenlight top-up, brokerage draw…)</button>
+        <button class="secondary small" id="toggleBookedBtn" style="display:none;"></button>
+      </div>
+      <div id="bookedContainer" style="display:none;margin-top:14px;">
+        <div class="rule-group-title">Marked as already booked (moved to a past date)</div>
+        <table>
+          <thead><tr><th>Date</th><th>Item</th><th class="num">Amount</th><th></th></tr></thead>
+          <tbody id="bookedBody"></tbody>
+        </table>
       </div>
     </div>
   </div>
@@ -755,7 +763,20 @@
       return;
     }
     var today = new Date(); today.setHours(0,0,0,0);
-    events.slice(0,80).forEach(function(e){
+    // Items you deliberately moved to a past date are treated as already booked/done:
+    // hide them from the list (they still count in the running balance, since they
+    // really happened). Items that are merely past because the sheet is stale keep
+    // showing with the "overdue" badge.
+    var visible = events.filter(function(e){
+      if(e.dateMoved && e.date < today) return false;
+      return true;
+    });
+    var hiddenBooked = events.length - visible.length;
+    if(visible.length===0){
+      body.innerHTML = '<tr><td colspan="6" class="muted">Nothing upcoming'+(hiddenBooked>0?' — '+hiddenBooked+' item(s) marked as already booked are hidden.':'.')+'</td></tr>';
+      return;
+    }
+    visible.slice(0,80).forEach(function(e){
       var tr = document.createElement('tr');
       var isPastDue = e.date < today;
       if(isPastDue) tr.className = 'pastdue';
@@ -832,6 +853,43 @@
         saveState().then(render);
       });
     });
+
+    // ----- "already booked" (moved to past) items -----
+    var booked = events.filter(function(e){ return e.dateMoved && e.date < today; });
+    var toggleBtn = document.getElementById('toggleBookedBtn');
+    var bookedContainer = document.getElementById('bookedContainer');
+    var bookedBody = document.getElementById('bookedBody');
+    if(booked.length === 0){
+      toggleBtn.style.display = 'none';
+      bookedContainer.style.display = 'none';
+    } else {
+      toggleBtn.style.display = 'inline-block';
+      var showing = toggleBtn.getAttribute('data-showing') === '1';
+      toggleBtn.textContent = (showing?'Hide':'Show')+' '+booked.length+' booked item'+(booked.length>1?'s':'');
+      bookedContainer.style.display = showing ? 'block' : 'none';
+      bookedBody.innerHTML = '';
+      booked.forEach(function(e){
+        var tr = document.createElement('tr');
+        tr.innerHTML =
+          '<td>'+fmtDateShort(e.date)+' <span class="muted">(from '+fmtDateShort(e.origDate)+')</span></td>'+
+          '<td>'+e.name+'</td>'+
+          '<td class="num">'+fmtMoney(e.delta)+'</td>'+
+          '<td><button class="small secondary unbook-btn" data-key="'+e.overrideKey+'">un-book</button></td>';
+        bookedBody.appendChild(tr);
+      });
+      bookedBody.querySelectorAll('.unbook-btn').forEach(function(btn){
+        btn.addEventListener('click', function(){
+          delete state.dateOverrides[btn.getAttribute('data-key')];
+          saveState().then(render);
+        });
+      });
+    }
+    toggleBtn.onclick = function(){
+      var showing = toggleBtn.getAttribute('data-showing') === '1';
+      toggleBtn.setAttribute('data-showing', showing ? '0' : '1');
+      bookedContainer.style.display = showing ? 'none' : 'block';
+      toggleBtn.textContent = (showing?'Show':'Hide')+' '+booked.length+' booked item'+(booked.length>1?'s':'');
+    };
   }
 
   function ruleScheduleSummary(r){
