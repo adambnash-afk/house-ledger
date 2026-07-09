@@ -199,7 +199,7 @@
         <button class="secondary small" id="toggleBookedBtn" style="display:none;"></button>
       </div>
       <div id="bookedContainer" style="display:none;margin-top:14px;">
-        <div class="rule-group-title">Marked as already booked (moved to a past date)</div>
+        <div class="rule-group-title">Moved to a past date (booked / already reflected in balance) — reset any that were a mistake</div>
         <table>
           <thead><tr><th>Date</th><th>Item</th><th class="num">Amount</th><th></th></tr></thead>
           <tbody id="bookedBody"></tbody>
@@ -488,11 +488,13 @@
 
   function buildProjection(){
     // The anchor balance is treated as "as of end of day" on anchor.date — any
-    // rule occurrence landing on that same date is already baked into it, so
-    // projection starts the following day to avoid double-counting it.
-    var start = addDays(parseYMD(state.anchor.date), 1);
+    // rule occurrence landing on or before that date is already baked into it, so
+    // it must NOT be re-applied to the projection (that would double-count).
+    var anchorDate = parseYMD(state.anchor.date);
+    var start = addDays(anchorDate, 1);
     var end = addDays(start, state.horizonDays);
     var events = [];
+    var bakedIn = []; // occurrences moved to on/before the anchor — already in the balance, kept for reversibility
     state.rules.forEach(function(rule){
       occurrences(rule, start, end).forEach(function(d){
         var r = resolveAmount(rule, d);
@@ -506,7 +508,12 @@
           var od = parseYMD(state.dateOverrides[r.key]);
           if(od){ effDate = od; dateMoved = (fmtYMD(od) !== fmtYMD(d)); }
         }
-        events.push({date:effDate, origDate:origDate, dateMoved:dateMoved, ruleId:rule.id, name:rule.name, category:rule.category, amount:r.amount, delta:delta, estimated:r.estimated, verify:!!rule.verify, overrideKey:r.key});
+        var ev = {date:effDate, origDate:origDate, dateMoved:dateMoved, ruleId:rule.id, name:rule.name, category:rule.category, amount:r.amount, delta:delta, estimated:r.estimated, verify:!!rule.verify, overrideKey:r.key};
+        // If the effective date is on or before the anchor, its cash impact is
+        // already reflected in the anchored balance — exclude it from the running
+        // projection, but keep a record so it stays visible and reversible.
+        if(effDate <= anchorDate){ bakedIn.push(ev); }
+        else { events.push(ev); }
       });
     });
     // sort by EFFECTIVE date (with a stable tiebreak) so a moved occurrence lands
@@ -517,6 +524,7 @@
     });
     var running = state.anchor.balance;
     events.forEach(function(e){ running += e.delta; e.runningBalance = running; });
+    events.bakedIn = bakedIn; // attach for the Upcoming/booked UI to surface
     return events;
   }
 
@@ -872,8 +880,13 @@
       });
     });
 
-    // ----- "already booked" (moved to past) items -----
-    var booked = events.filter(function(e){ return e.dateMoved && e.date < today; });
+    // ----- "already booked" items — reversible so mistakes can be undone -----
+    // Two sources: (a) items still in the projection but moved to a past date
+    // after the anchor, and (b) items moved to on/before the anchor, which
+    // buildProjection removed from the running total entirely (events.bakedIn).
+    var bookedFromEvents = events.filter(function(e){ return e.dateMoved && e.date < today; });
+    var bookedFromBaked = (events.bakedIn || []).filter(function(e){ return e.dateMoved; });
+    var booked = bookedFromEvents.concat(bookedFromBaked);
     var toggleBtn = document.getElementById('toggleBookedBtn');
     var bookedContainer = document.getElementById('bookedContainer');
     var bookedBody = document.getElementById('bookedBody');
@@ -883,16 +896,18 @@
     } else {
       toggleBtn.style.display = 'inline-block';
       var showing = toggleBtn.getAttribute('data-showing') === '1';
-      toggleBtn.textContent = (showing?'Hide':'Show')+' '+booked.length+' booked item'+(booked.length>1?'s':'');
+      toggleBtn.textContent = (showing?'Hide':'Show')+' '+booked.length+' booked/moved item'+(booked.length>1?'s':'');
       bookedContainer.style.display = showing ? 'block' : 'none';
       bookedBody.innerHTML = '';
       booked.forEach(function(e){
+        var beforeAnchor = e.date <= parseYMD(state.anchor.date);
+        var tag = beforeAnchor ? ' <span class="muted">(before anchor — not counted in projection; already in your reconciled balance)</span>' : '';
         var tr = document.createElement('tr');
         tr.innerHTML =
           '<td>'+fmtDateShort(e.date)+' <span class="muted">(from '+fmtDateShort(e.origDate)+')</span></td>'+
-          '<td>'+e.name+'</td>'+
+          '<td>'+e.name+tag+'</td>'+
           '<td class="num">'+fmtMoney(e.delta)+'</td>'+
-          '<td><button class="small secondary unbook-btn" data-key="'+e.overrideKey+'">un-book</button></td>';
+          '<td><button class="small secondary unbook-btn" data-key="'+e.overrideKey+'">un-book / reset date</button></td>';
         bookedBody.appendChild(tr);
       });
       bookedBody.querySelectorAll('.unbook-btn').forEach(function(btn){
@@ -906,7 +921,7 @@
       var showing = toggleBtn.getAttribute('data-showing') === '1';
       toggleBtn.setAttribute('data-showing', showing ? '0' : '1');
       bookedContainer.style.display = showing ? 'none' : 'block';
-      toggleBtn.textContent = (showing?'Show':'Hide')+' '+booked.length+' booked item'+(booked.length>1?'s':'');
+      toggleBtn.textContent = (showing?'Show':'Hide')+' '+booked.length+' booked/moved item'+(booked.length>1?'s':'');
     };
   }
 
