@@ -892,12 +892,14 @@
         var delta = parseFloat(btn.getAttribute('data-delta'));
         var dateStr = btn.getAttribute('data-date');
         var nm = decodeURIComponent(btn.getAttribute('data-name'));
-        if(!confirm('Mark "'+nm+'" ('+fmtMoney(delta)+') as booked?\n\nThis folds it into your balance ('+fmtMoney(state.anchor.balance)+' → '+fmtMoney(state.anchor.balance+delta)+') and removes it from the running total. Use this when the item has actually posted.')) return;
-        // fold into anchor: balance changes by delta; advance anchor date if this item is later
+        if(!confirm('Mark "'+nm+'" ('+fmtMoney(delta)+') as booked?\n\nThis folds it into your balance ('+fmtMoney(state.anchor.balance)+' → '+fmtMoney(state.anchor.balance+delta)+') and removes just this item from the running total. Use this when the item has actually posted.')) return;
+        // Record the anchor balance before folding, so un-book can reverse exactly.
+        // IMPORTANT: we do NOT advance the anchor date — doing so would sweep out
+        // every other pending item dated on/before this one. Booking removes ONLY
+        // this single occurrence (via bookedKeys), and folds only its amount.
+        var prevAnchor = {date: state.anchor.date, balance: state.anchor.balance};
         state.anchor.balance = state.anchor.balance + delta;
-        var itemDate = parseYMD(dateStr);
-        if(itemDate > parseYMD(state.anchor.date)){ state.anchor.date = dateStr; }
-        state.bookedKeys[key] = {delta:delta, date:dateStr, name:nm};
+        state.bookedKeys[key] = {delta:delta, date:dateStr, name:nm, prevAnchor:prevAnchor};
         saveState().then(render);
       });
     });
@@ -958,7 +960,10 @@
           var key = btn.getAttribute('data-key');
           var b = state.bookedKeys[key];
           if(!b) return;
-          if(!confirm('Un-book "'+b.name+'"? This reverses the balance fold ('+fmtMoney(state.anchor.balance)+' → '+fmtMoney(state.anchor.balance - b.delta)+') and returns it to the upcoming list.\n\nNote: this does not restore the previous anchor DATE — if booking advanced your anchor date, re-reconcile if the date matters.')) return;
+          if(!confirm('Un-book "'+b.name+'"? This reverses the balance fold ('+fmtMoney(state.anchor.balance)+' → '+fmtMoney(state.anchor.balance - b.delta)+') and returns it to the upcoming list.')) return;
+          // Reverse the balance fold. Booking no longer moves the anchor date, so
+          // just undo the amount and drop the booked marker — the occurrence
+          // regenerates into the upcoming list on the next render.
           state.anchor.balance = state.anchor.balance - b.delta;
           delete state.bookedKeys[key];
           saveState().then(render);
