@@ -389,6 +389,7 @@
       horizonDays: 120,
       overrides: {},
       dateOverrides: {},
+      bookedKeys: {},
       reconcileHistory: [],
       rules: []
     };
@@ -405,6 +406,7 @@
     // backfill fields that may be absent in files saved by older versions
     if(!s.overrides) s.overrides = {};
     if(!s.dateOverrides) s.dateOverrides = {};
+    if(!s.bookedKeys) s.bookedKeys = {};
     if(!s.reconcileHistory) s.reconcileHistory = [];
     if(!s.rules) s.rules = [];
     return s;
@@ -509,6 +511,9 @@
           if(od){ effDate = od; dateMoved = (fmtYMD(od) !== fmtYMD(d)); }
         }
         var ev = {date:effDate, origDate:origDate, dateMoved:dateMoved, ruleId:rule.id, name:rule.name, category:rule.category, amount:r.amount, delta:delta, estimated:r.estimated, verify:!!rule.verify, overrideKey:r.key};
+        // If this occurrence was explicitly marked "booked", its amount was folded
+        // into the anchor balance at that time — skip it entirely (no double-count).
+        if(state.bookedKeys.hasOwnProperty(r.key)){ return; }
         // If the effective date is on or before the anchor, its cash impact is
         // already reflected in the anchored balance — exclude it from the running
         // projection, but keep a record so it stays visible and reversible.
@@ -828,13 +833,15 @@
       if(e.dateMoved){
         dateCell += '<div class="moved-note">moved from '+fmtDateShort(e.origDate)+' <button class="link-btn date-reset-btn" data-key="'+e.overrideKey+'">reset</button></div>';
       }
+      // "book" folds this posted item into the anchor and drops it from the projection
+      var bookBtn = '<button class="small secondary book-btn" data-key="'+e.overrideKey+'" data-delta="'+e.delta+'" data-date="'+fmtYMD(e.date)+'" data-name="'+encodeURIComponent(e.name)+'" title="Mark this item as posted — folds it into your balance and removes it from the running total">book</button>';
       tr.innerHTML =
         '<td>'+dateCell+'</td>'+
         '<td>'+e.name+' '+badges+'</td>'+
         '<td class="muted">'+e.category+'</td>'+
         '<td class="num">'+amtCell+'</td>'+
         '<td class="num">'+fmtMoney(e.runningBalance)+'</td>'+
-        '<td>'+editHtml+'</td>';
+        '<td>'+bookBtn+' '+editHtml+'</td>';
       body.appendChild(tr);
     });
     body.querySelectorAll('.confirm-btn').forEach(function(btn){
@@ -879,14 +886,34 @@
         saveState().then(render);
       });
     });
+    body.querySelectorAll('.book-btn').forEach(function(btn){
+      btn.addEventListener('click', function(){
+        var key = btn.getAttribute('data-key');
+        var delta = parseFloat(btn.getAttribute('data-delta'));
+        var dateStr = btn.getAttribute('data-date');
+        var nm = decodeURIComponent(btn.getAttribute('data-name'));
+        if(!confirm('Mark "'+nm+'" ('+fmtMoney(delta)+') as booked?\n\nThis folds it into your balance ('+fmtMoney(state.anchor.balance)+' → '+fmtMoney(state.anchor.balance+delta)+') and removes it from the running total. Use this when the item has actually posted.')) return;
+        // fold into anchor: balance changes by delta; advance anchor date if this item is later
+        state.anchor.balance = state.anchor.balance + delta;
+        var itemDate = parseYMD(dateStr);
+        if(itemDate > parseYMD(state.anchor.date)){ state.anchor.date = dateStr; }
+        state.bookedKeys[key] = {delta:delta, date:dateStr, name:nm};
+        saveState().then(render);
+      });
+    });
 
-    // ----- "already booked" items — reversible so mistakes can be undone -----
-    // Two sources: (a) items still in the projection but moved to a past date
-    // after the anchor, and (b) items moved to on/before the anchor, which
-    // buildProjection removed from the running total entirely (events.bakedIn).
+    // ----- "booked / moved" panel — all reversible so mistakes can be undone -----
+    // Three sources:
+    //  (a) items moved to a past date after the anchor (still in projection, filtered from list)
+    //  (b) items moved to on/before the anchor (removed from running total; events.bakedIn)
+    //  (c) items explicitly marked "booked" (folded into the anchor; state.bookedKeys)
     var bookedFromEvents = events.filter(function(e){ return e.dateMoved && e.date < today; });
     var bookedFromBaked = (events.bakedIn || []).filter(function(e){ return e.dateMoved; });
-    var booked = bookedFromEvents.concat(bookedFromBaked);
+    var explicitlyBooked = Object.keys(state.bookedKeys).map(function(k){
+      var b = state.bookedKeys[k];
+      return {overrideKey:k, name:b.name, delta:b.delta, date:parseYMD(b.date), booked:true};
+    });
+    var booked = bookedFromEvents.concat(bookedFromBaked).concat(explicitlyBooked);
     var toggleBtn = document.getElementById('toggleBookedBtn');
     var bookedContainer = document.getElementById('bookedContainer');
     var bookedBody = document.getElementById('bookedBody');
@@ -900,19 +927,40 @@
       bookedContainer.style.display = showing ? 'block' : 'none';
       bookedBody.innerHTML = '';
       booked.forEach(function(e){
-        var beforeAnchor = e.date <= parseYMD(state.anchor.date);
-        var tag = beforeAnchor ? ' <span class="muted">(before anchor — not counted in projection; already in your reconciled balance)</span>' : '';
         var tr = document.createElement('tr');
+        var label, btnLabel, btnClass;
+        if(e.booked){
+          label = ' <span class="badge confirmed">booked</span> <span class="muted">(folded into balance)</span>';
+          btnLabel = 'un-book (restore to list)';
+          btnClass = 'unbook-explicit-btn';
+        } else {
+          var beforeAnchor = e.date <= parseYMD(state.anchor.date);
+          label = beforeAnchor ? ' <span class="muted">(before anchor — already in reconciled balance)</span>' : ' <span class="muted">(moved to past date)</span>';
+          btnLabel = 'reset date';
+          btnClass = 'unbook-btn';
+        }
+        var dateFrom = e.origDate ? ' <span class="muted">(from '+fmtDateShort(e.origDate)+')</span>' : '';
         tr.innerHTML =
-          '<td>'+fmtDateShort(e.date)+' <span class="muted">(from '+fmtDateShort(e.origDate)+')</span></td>'+
-          '<td>'+e.name+tag+'</td>'+
+          '<td>'+fmtDateShort(e.date)+dateFrom+'</td>'+
+          '<td>'+e.name+label+'</td>'+
           '<td class="num">'+fmtMoney(e.delta)+'</td>'+
-          '<td><button class="small secondary unbook-btn" data-key="'+e.overrideKey+'">un-book / reset date</button></td>';
+          '<td><button class="small secondary '+btnClass+'" data-key="'+e.overrideKey+'">'+btnLabel+'</button></td>';
         bookedBody.appendChild(tr);
       });
       bookedBody.querySelectorAll('.unbook-btn').forEach(function(btn){
         btn.addEventListener('click', function(){
           delete state.dateOverrides[btn.getAttribute('data-key')];
+          saveState().then(render);
+        });
+      });
+      bookedBody.querySelectorAll('.unbook-explicit-btn').forEach(function(btn){
+        btn.addEventListener('click', function(){
+          var key = btn.getAttribute('data-key');
+          var b = state.bookedKeys[key];
+          if(!b) return;
+          if(!confirm('Un-book "'+b.name+'"? This reverses the balance fold ('+fmtMoney(state.anchor.balance)+' → '+fmtMoney(state.anchor.balance - b.delta)+') and returns it to the upcoming list.\n\nNote: this does not restore the previous anchor DATE — if booking advanced your anchor date, re-reconcile if the date matters.')) return;
+          state.anchor.balance = state.anchor.balance - b.delta;
+          delete state.bookedKeys[key];
           saveState().then(render);
         });
       });
